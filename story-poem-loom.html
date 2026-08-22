@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>The Story-Poem Loom</title>
+<link
+  rel="stylesheet"
+  href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Crimson+Text:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap"
+/>
+<script type="importmap">
+{
+  "imports": {
+    "web-txt2img": "https://esm.sh/web-txt2img@0.3.1",
+    "@xenova/transformers": "https://esm.sh/@xenova/transformers@latest"
+  }
+}
+</script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+  .loom-entry { animation: fadeIn 0.35s ease-out; }
+  .loom-pulse { animation: pulse 1.4s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react" data-type="module">
+const { useState, useRef, useEffect } = React;
+
+// ---------- palette / tokens ----------
+const C = {
+  parchment: "#EDE4D3",
+  parchmentDark: "#E1D5BC",
+  ink: "#2B2620",
+  inkFaint: "#6b6152",
+  gold: "#A67C3D",
+  goldBright: "#C79A4B",
+  crimson: "#7A2E2E",
+  sage: "#5C6B54",
+};
+
+const MAX_ROUNDS = 4;
+const SCORE_TARGET = 8.5;
+const CLAUDE_MODEL = "claude-sonnet-4-6";
+
+const PREMISE_IDEAS = [
+  "A lighthouse keeper who begins receiving letters from a ship that sank a century ago.",
+  "A tailor in a mountain village who can stitch a person's luck into their coat, for a price.",
+  "A retired astronaut who starts hearing radio transmissions from a mission that never launched.",
+  "A librarian discovers that one book in the archive rewrites itself to match the reader's secrets.",
+  "Two sisters inherit an orchard where the trees only bear fruit the night before something changes forever.",
+  "A cartographer is hired to map a city that keeps a different shape every time someone new arrives.",
+  "A clockmaker's apprentice realizes the shop's oldest clock is running backward through someone's life.",
+  "A night-shift train conductor keeps stopping at a station that isn't on any line, for a passenger who is always waiting.",
+  "An old fisherman starts pulling up nets full of things that haven't happened yet.",
+  "A glassblower discovers she can trap a person's grief inside a bottle, and a queue starts forming outside her shop.",
+  "A war photographer finds a camera that only develops photos of what almost happened instead.",
+  "A beekeeper notices his hives have started translating the village's oldest secrets into honey.",
+  "A locksmith is called to a house where every door opens onto a different year of the same family's life.",
+  "A radio DJ on a small-town station starts taking calls from listeners who died decades ago.",
+  "A gravedigger in a coastal town realizes the tide is returning more than it takes.",
+];
+
+function randomPremise(current) {
+  const options = PREMISE_IDEAS.filter((p) => p !== current);
+  return options[Math.floor(Math.random() * options.length)] || PREMISE_IDEAS[0];
+}
+
+// ---------- Claude (text) ----------
+async function callClaude(apiKey, system, user, maxTokens = 1000) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: "user", content: user }],
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Claude API error ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const text = (data.content || [])
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+  return { text: text.trim() };
+}
+
+async function callClaudeVisionBase64(apiKey, system, image, userText, maxTokens = 500) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: maxTokens,
+      system,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data } },
+            { type: "text", text: userText },
+          ],
+        },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Claude API error ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const text = (data.content || [])
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+  return { text: text.trim() };
+}
+
+function stripFence(s) {
+  return s.replace(/^```[a-z]*\n?/i, "").replace(/```$/i, "").trim();
+}
+
+function parseScoreJSON(raw) {
+  try {
+    const obj = JSON.parse(stripFence(raw));
+    const nums = Object.entries(obj).filter(([k, v]) => typeof v === "number");
+    const avg = nums.reduce((a, [, v]) => a + v, 0) / (nums.length || 1);
+    return { obj, avg };
+  } catch {
+    return { obj: { note: "(the Critic's note didn't parse cleanly this round)" }, avg: 0 };
+  }
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("Failed to read generated image"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function parseDataUrl(dataUrl) {
+  const match = dataUrl.match(/^data:([^;]+);base64,(.*)$/s);
+  if (!match) return null;
+  return { mimeType: match[1], data: match[2] };
+}
+
+const POET_SYSTEM = `You are the Poet, one half of a two-AI creative duo writing a story-poem together, one segment at a time.
+Write ONE segment (8-14 lines) that continues the story. Lyrical, image-rich, concrete sensory detail over abstraction. Advance the plot or feeling — don't stall.
+If given critique from your collaborator (the Critic), revise substantially in response to it, don't just tweak word choice.
+Reply with ONLY the poem segment. No title, no preamble, no markdown, no quotation marks around it.`;
+
+const CRITIC_TEXT_SYSTEM = `You are the Critic, collaborator to the Poet. You read a poem segment and score it honestly and a little strictly — a score of 8+ should be rare and earned.
+Score integers 1-10 on: imagery (concrete, surprising sensory detail), rhythm (sonic quality read aloud), resonance (emotional charge), continuity (fits the story so far).
+Give exactly one specific, actionable note — the single change that would most improve it.
+Reply with ONLY valid JSON, no markdown fences: {"imagery":n,"rhythm":n,"resonance":n,"continuity":n,"note":"..."}`;
+
+const CRITIC_ART_SYSTEM = `You are the Critic, collaborator to the Illustrator. You are shown an actual illustration (an image) together with the poem segment it depicts. Score it honestly and a little strictly — a score of 8+ should be rare and earned. Keep in mind this illustration came from a small, fast, low-resolution model running on someone's phone, not a large hosted model — judge it on composition and relevance rather than photographic detail.
+Score integers 1-10 on: composition (balance, focal point), mood (matches the poem's feeling), clarity (recognizable as depicting something, not pure noise/abstraction), relevance (depicts the poem's central image).
+Give exactly one specific, actionable note the Illustrator can act on for its next revision.
+Reply with ONLY valid JSON, no markdown fences: {"composition":n,"mood":n,"clarity":n,"relevance":n,"note":"..."}`;
+
+function illustratorPrompt(poem, note) {
+  const gist = poem.replace(/\s+/g, " ").trim().slice(0, 200);
+  return `muted woodcut illustration, parchment background, ink linework, gold and crimson accents, spare composition: ${gist}${note ? `. ${note}` : ""}`;
+}
+
+// ---------- Local WebGPU image generation (the Illustrator) — no account, no key, no server ----------
+// The library constructs `new Worker(<esm.sh URL>)` internally, which browsers refuse regardless of
+// hosting or CORS headers — Worker() always requires a same-origin script. The fix: fetch the worker
+// script ourselves (fetch() DOES respect CORS, and esm.sh allows it), rehost it as a same-origin
+// blob: URL, and patch window.Worker to substitute that blob URL whenever the library asks for the
+// esm.sh one. Nested imports inside the worker still resolve fine, since those go through the normal
+// CORS-checked module-fetch path rather than the stricter same-origin Worker() rule.
+const WORKER_SCRIPT_URL = "https://esm.sh/web-txt2img@0.3.1/es2022/host.js";
+let workerPatchInstalled = false;
+
+async function prefetchWorkerBlobUrl(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Could not fetch worker script (${res.status})`);
+  const src = await res.text();
+  const blob = new Blob([src], { type: "text/javascript" });
+  return URL.createObjectURL(blob);
+}
+
+function installWorkerPatch(matchFragment, blobUrl) {
+  if (workerPatchInstalled) return;
+  workerPatchInstalled = true;
+  const RealWorker = window.Worker;
+  function PatchedWorker(url, options) {
+    let urlStr = "";
+    try {
+      urlStr = typeof url === "string" ? url : url.href;
+    } catch {}
+    if (urlStr.includes(matchFragment)) {
+      return new RealWorker(blobUrl, options);
+    }
+    return new RealWorker(url, options);
+  }
+  PatchedWorker.prototype = RealWorker.prototype;
+  window.Worker = PatchedWorker;
+}
+
+let webgpuClientPromise = null;
+function getWebgpuClient() {
+  if (!webgpuClientPromise) {
+    webgpuClientPromise = prefetchWorkerBlobUrl(WORKER_SCRIPT_URL)
+      .then((blobUrl) => {
+        installWorkerPatch("web-txt2img", blobUrl);
+        return import("web-txt2img");
+      })
+      .then(({ Txt2ImgWorkerClient }) => Txt2ImgWorkerClient.createDefault());
+  }
+  return webgpuClientPromise;
+}
+
+let modelLoadPromise = null;
+function ensureModelLoaded(onProgress) {
+  if (!modelLoadPromise) {
+    modelLoadPromise = getWebgpuClient().then(async (client) => {
+      const res = await client.load("sd-turbo", { backendPreference: ["webgpu"] }, onProgress);
+      if (!res?.ok) throw new Error(res?.message || "model failed to load");
+      return client;
+    });
+  }
+  return modelLoadPromise;
+}
+
+async function generateIllustrationLocal(promptText, seed, onProgress) {
+  const client = await ensureModelLoaded(onProgress);
+  const { promise } = client.generate({ prompt: promptText, seed }, onProgress);
+  const gen = await promise;
+  if (!gen.ok) throw new Error(gen.message || gen.reason || "generation failed");
+  return blobToDataUrl(gen.blob);
+}
+
+function Scorebar({ obj }) {
+  const entries = Object.entries(obj).filter(([, v]) => typeof v === "number");
+  return (
+    <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 4 }}>
+      {entries.map(([k, v]) => (
+        <span
+          key={k}
+          style={{
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 11,
+            color: v >= 8 ? C.sage : C.inkFaint,
+            border: `1px solid ${v >= 8 ? C.sage : C.parchmentDark}`,
+            borderRadius: 3,
+            padding: "1px 6px",
+          }}
+        >
+          {k} {v}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function MiniImage({ src }) {
+  if (!src) {
+    return (
+      <div
+        style={{
+          width: 72,
+          height: 54,
+          border: `1px dashed ${C.parchmentDark}`,
+          borderRadius: 3,
+          flexShrink: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontFamily: "'JetBrains Mono', monospace",
+          fontSize: 9,
+          color: C.inkFaint,
+          textAlign: "center",
+        }}
+      >
+        no sketch
+      </div>
+    );
+  }
+  return (
+    <img
+      src={src}
+      alt="illustration draft"
+      style={{
+        width: 72,
+        height: 54,
+        objectFit: "cover",
+        border: `1px solid ${C.parchmentDark}`,
+        borderRadius: 3,
+        flexShrink: 0,
+      }}
+    />
+  );
+}
+
+// A single full-size, permanent block for one Poet round. Every round gets one of these,
+// stacked in order — nothing is ever swapped out or shrunk down once it's rendered.
+function PoetRoundBlock({ round, index, isFirst }) {
+  const text = (round.draft || "").trim();
+  const first = isFirst ? text[0] || "" : "";
+  const rest = isFirst ? text.slice(1) : text;
+  return (
+    <div className="loom-entry" style={{ marginBottom: 18 }}>
+      <div
+        style={{
+          fontFamily: "'JetBrains Mono', monospace",
+          fontSize: 11,
+          color: C.gold,
+          letterSpacing: "0.05em",
+          marginBottom: 4,
+        }}
+      >
+        POET · ROUND {index + 1}
+        {round.avg != null ? ` — avg ${round.avg.toFixed(1)}` : ""}
+      </div>
+      <p style={{ fontFamily: "'Crimson Text', serif", fontSize: 19, lineHeight: 1.75, color: C.ink, whiteSpace: "pre-line", margin: 0 }}>
+        {isFirst && (
+          <span
+            style={{
+              fontFamily: "'Playfair Display', serif",
+              fontSize: 56,
+              color: C.crimson,
+              float: "left",
+              lineHeight: 0.8,
+              padding: "6px 8px 0 0",
+              fontWeight: 700,
+            }}
+          >
+            {first}
+          </span>
+        )}
+        {rest}
+      </p>
+      {round.scores && Object.keys(round.scores).some((k) => typeof round.scores[k] === "number") && (
+        <div style={{ marginTop: 8 }}>
+          <Scorebar obj={round.scores} />
+        </div>
+      )}
+      {round.scores && round.scores.note && (
+        <div style={{ fontFamily: "'Crimson Text', serif", fontStyle: "italic", fontSize: 14, color: C.inkFaint, marginTop: 4 }}>
+          Critic: “{round.scores.note}”
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Same idea for the Illustrator's rounds — image or status, permanently stacked.
+function ArtRoundBlock({ round, index }) {
+  return (
+    <div className="loom-entry" style={{ marginBottom: 18 }}>
+      <div
+        style={{
+          fontFamily: "'JetBrains Mono', monospace",
+          fontSize: 11,
+          color: C.gold,
+          letterSpacing: "0.05em",
+          marginBottom: 6,
+        }}
+      >
+        ILLUSTRATOR · ROUND {index + 1}
+        {round.avg != null ? ` — avg ${round.avg.toFixed(1)}` : ""}
+      </div>
+      {round.image && (
+        <div style={{ border: `1px solid ${C.parchmentDark}`, borderRadius: 4, overflow: "hidden", maxWidth: 320, marginBottom: 6 }}>
+          <img src={round.image} alt={`Illustration attempt ${index + 1}`} style={{ width: "100%", display: "block" }} />
+        </div>
+      )}
+      {!round.image && round.progressLabel && !round.error && (
+        <div
+          className="loom-pulse"
+          style={{
+            border: `1px solid ${C.parchmentDark}`,
+            borderRadius: 4,
+            maxWidth: 320,
+            minHeight: 70,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            marginBottom: 6,
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 11,
+            color: C.inkFaint,
+          }}
+        >
+          {round.progressLabel}
+        </div>
+      )}
+      {round.error && (
+        <div style={{ border: `1px solid ${C.crimson}`, borderRadius: 4, padding: 10, maxWidth: 320, marginBottom: 6 }}>
+          <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.crimson }}>{round.error}</div>
+        </div>
+      )}
+      {round.scores && Object.keys(round.scores).some((k) => typeof round.scores[k] === "number") && <Scorebar obj={round.scores} />}
+      {round.scores && round.scores.note && (
+        <div style={{ fontFamily: "'Crimson Text', serif", fontStyle: "italic", fontSize: 14, color: C.inkFaint, marginTop: 4 }}>
+          Critic: “{round.scores.note}”
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SealStamp() {
+  return (
+    <div
+      title="Approved by the Critic"
+      style={{
+        position: "absolute",
+        top: 14,
+        right: 14,
+        width: 46,
+        height: 46,
+        borderRadius: "50%",
+        border: `2px solid ${C.crimson}`,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        transform: "rotate(-8deg)",
+        opacity: 0.85,
+      }}
+    >
+      <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 10, letterSpacing: "0.08em", color: C.crimson, textAlign: "center", lineHeight: 1.1 }}>
+        APPROVED
+      </span>
+    </div>
+  );
+}
+
+function StageBadge({ label }) {
+  return (
+    <div
+      className="loom-pulse"
+      style={{
+        position: "absolute",
+        top: 14,
+        right: 14,
+        fontFamily: "'JetBrains Mono', monospace",
+        fontSize: 10,
+        letterSpacing: "0.06em",
+        color: C.gold,
+        border: `1px dashed ${C.gold}`,
+        borderRadius: 4,
+        padding: "3px 8px",
+        textTransform: "uppercase",
+      }}
+    >
+      {label}
+    </div>
+  );
+}
+
+// Every round — poem drafts and illustration attempts alike — renders as its own permanent,
+// full-size block in order. Nothing collapses, shrinks, or gets replaced as new rounds arrive;
+// the whole history for this segment just keeps growing downward, like a blog.
+function SegmentCard({ index, textRounds, artRounds, inProgress, stageLabel }) {
+  return (
+    <div
+      style={{
+        position: "relative",
+        background: "#fff9ef",
+        border: `1px solid ${inProgress ? C.gold : C.parchmentDark}`,
+        borderRadius: 6,
+        padding: 24,
+        marginBottom: 22,
+        boxShadow: "0 1px 3px rgba(0,0,0,0.06)",
+      }}
+    >
+      {inProgress ? <StageBadge label={stageLabel} /> : <SealStamp />}
+      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.gold, letterSpacing: "0.1em", marginBottom: 14 }}>
+        SEGMENT {index + 1}
+      </div>
+
+      {textRounds.length === 0 && (
+        <div className="loom-pulse" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: C.inkFaint }}>
+          the Poet is drafting…
+        </div>
+      )}
+      {textRounds.map((r, i) => (
+        <PoetRoundBlock key={i} round={r} index={i} isFirst={i === 0} />
+      ))}
+
+      {artRounds.map((r, i) => (
+        <ArtRoundBlock key={i} round={r} index={i} />
+      ))}
+    </div>
+  );
+}
+
+function ApiKeyGate({ onSubmit }) {
+  const [draft, setDraft] = useState("");
+  return (
+    <div style={{ maxWidth: 460, margin: "80px auto", background: "#fff9ef", border: `1px solid ${C.parchmentDark}`, borderRadius: 6, padding: 28, fontFamily: "'Crimson Text', serif" }}>
+      <div style={{ fontFamily: "'Playfair Display', serif", fontWeight: 900, fontSize: 22, marginBottom: 8, color: C.ink }}>
+        One key needed
+      </div>
+      <p style={{ color: C.inkFaint, fontSize: 14, lineHeight: 1.5 }}>
+        This file calls Claude for the Poet and both Critics. The Illustrator runs entirely on your phone via WebGPU —
+        no account, no key, nothing sent anywhere for that part. Your Claude key stays only in this page's memory —
+        never saved to disk — and is gone when you close the tab.
+      </p>
+      <label style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.inkFaint, textTransform: "uppercase" }}>
+        Anthropic API key
+      </label>
+      <input
+        type="password"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        placeholder="sk-ant-..."
+        style={{ width: "100%", padding: 10, fontFamily: "'JetBrains Mono', monospace", fontSize: 13, border: `1px solid ${C.parchmentDark}`, borderRadius: 4, marginTop: 6, boxSizing: "border-box" }}
+      />
+      <button
+        onClick={() => onSubmit(draft.trim())}
+        disabled={!draft.trim()}
+        style={{
+          marginTop: 14,
+          width: "100%",
+          background: C.ink,
+          color: C.parchment,
+          border: "none",
+          borderRadius: 4,
+          padding: "10px 0",
+          fontFamily: "'Playfair Display', serif",
+          fontWeight: 700,
+          fontSize: 15,
+          cursor: draft.trim() ? "pointer" : "default",
+          opacity: draft.trim() ? 1 : 0.5,
+        }}
+      >
+        Continue
+      </button>
+    </div>
+  );
+}
+
+function WebGpuGate({ onContinueAnyway }) {
+  return (
+    <div style={{ maxWidth: 460, margin: "20px auto", background: "#fff3ee", border: `1px solid ${C.crimson}`, borderRadius: 6, padding: 20, fontFamily: "'Crimson Text', serif" }}>
+      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: C.crimson, marginBottom: 8 }}>
+        WebGPU not detected
+      </div>
+      <p style={{ color: C.inkFaint, fontSize: 14, lineHeight: 1.5, marginTop: 0 }}>
+        This browser doesn't report WebGPU support, which the local Illustrator needs. It may still work when you try
+        it — this check can be conservative — but if illustrations fail, that's likely why. Chrome/Edge 113+ on a
+        device with a real GPU is the safest bet.
+      </p>
+      <button
+        onClick={onContinueAnyway}
+        style={{ background: "none", border: `1px solid ${C.gold}`, color: C.gold, borderRadius: 4, padding: "6px 14px", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, cursor: "pointer" }}
+      >
+        Continue anyway
+      </button>
+    </div>
+  );
+}
+
+function StoryPoemLoom() {
+  const [anthropicKey, setAnthropicKey] = useState("");
+  const [webgpuOk, setWebgpuOk] = useState(null); // null = unchecked, true/false after check
+  const [dismissedGpuWarning, setDismissedGpuWarning] = useState(false);
+  const [premise, setPremise] = useState("A lighthouse keeper who begins receiving letters from a ship that sank a century ago.");
+  const [segments, setSegments] = useState([]);
+  const [current, setCurrent] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    if (!("gpu" in navigator)) {
+      setWebgpuOk(false);
+      return;
+    }
+    navigator.gpu
+      .requestAdapter()
+      .then((adapter) => setWebgpuOk(!!adapter))
+      .catch(() => setWebgpuOk(false));
+  }, []);
+
+  useEffect(() => {
+    scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [segments.length, current]);
+
+  if (!anthropicKey) {
+    return <ApiKeyGate onSubmit={setAnthropicKey} />;
+  }
+
+  if (webgpuOk === false && !dismissedGpuWarning) {
+    return <WebGpuGate onContinueAnyway={() => setDismissedGpuWarning(true)} />;
+  }
+
+  const storySoFar = () => segments.map((s) => s.finalPoem).join("\n\n");
+
+  async function runTextLoop() {
+    const rounds = [];
+    let poem = "";
+    let lastCritique = null;
+    for (let i = 0; i < MAX_ROUNDS; i++) {
+      setCurrent((c) => ({ ...c, stageLabel: `Poet (Claude) · round ${i + 1} of ${MAX_ROUNDS}` }));
+      const userMsg = `Story premise: ${premise}\n\nStory so far:\n${storySoFar() || "(this is the opening segment)"}\n\n${
+        lastCritique ? `Your previous draft:\n${poem}\n\nCritic's note to address:\n${lastCritique.note}` : "Write the next segment."
+      }`;
+      const draftRes = await callClaude(anthropicKey, POET_SYSTEM, userMsg);
+      poem = draftRes.text;
+      setCurrent((c) => ({ ...c, poem }));
+
+      setCurrent((c) => ({ ...c, stageLabel: `Critic (Claude) reading · round ${i + 1} of ${MAX_ROUNDS}` }));
+      const critiqueRaw = await callClaude(anthropicKey, CRITIC_TEXT_SYSTEM, `Story so far:\n${storySoFar()}\n\nNew segment to score:\n${poem}`);
+      const { obj, avg } = parseScoreJSON(critiqueRaw.text);
+      const round = { avg, scores: obj, draft: poem };
+      rounds.push(round);
+      setCurrent((c) => ({ ...c, textRounds: [...rounds] }));
+      lastCritique = obj;
+      if (avg >= SCORE_TARGET) break;
+    }
+    return { poem, rounds };
+  }
+
+  async function runArtLoop(poem) {
+    const rounds = [];
+    let lastImageDataUrl = null;
+    let lastCritique = null;
+    for (let i = 0; i < MAX_ROUNDS; i++) {
+      setCurrent((c) => ({ ...c, stageLabel: `Illustrator (local WebGPU) sketching · round ${i + 1} of ${MAX_ROUNDS}` }));
+      const round = { avg: null, scores: {}, image: null, error: null, progressLabel: "starting…" };
+      rounds.push(round);
+      setCurrent((c) => ({ ...c, artRounds: [...rounds] }));
+      try {
+        const seed = Math.floor(Math.random() * 2147483647);
+        const dataUrl = await generateIllustrationLocal(illustratorPrompt(poem, lastCritique?.note), seed, (p) => {
+          const pct = p?.pct != null ? `${p.pct}%` : "";
+          round.progressLabel = `${p?.message || p?.phase || "working"} ${pct}`.trim();
+          setCurrent((c) => ({ ...c, artRounds: [...rounds] }));
+        });
+        lastImageDataUrl = dataUrl;
+        round.image = dataUrl;
+        round.progressLabel = null;
+        setCurrent((c) => ({ ...c, image: dataUrl, artRounds: [...rounds] }));
+
+        const parsed = parseDataUrl(dataUrl);
+        if (!parsed) throw new Error("Generated image data couldn't be parsed");
+
+        setCurrent((c) => ({ ...c, stageLabel: `Critic (Claude) viewing · round ${i + 1} of ${MAX_ROUNDS}` }));
+        const critiqueRaw = await callClaudeVisionBase64(anthropicKey, CRITIC_ART_SYSTEM, parsed, `Poem segment:\n${poem}\n\nScore the attached illustration.`);
+        const { obj, avg } = parseScoreJSON(critiqueRaw.text);
+        round.avg = avg;
+        round.scores = obj;
+        lastCritique = obj;
+        setCurrent((c) => ({ ...c, artRounds: [...rounds] }));
+        if (avg >= SCORE_TARGET) break;
+      } catch (e) {
+        round.error = e.message || "unknown error";
+        round.progressLabel = null;
+        round.scores = { note: `round failed: ${round.error}` };
+        setCurrent((c) => ({ ...c, artRounds: [...rounds] }));
+        break;
+      }
+    }
+    return { image: lastImageDataUrl, rounds };
+  }
+
+  async function generateSegment() {
+    setBusy(true);
+    setError(null);
+    setCurrent({ poem: "", image: null, textRounds: [], artRounds: [], stageLabel: "starting…" });
+    try {
+      const { poem, rounds: textRounds } = await runTextLoop();
+      const { image, rounds: artRounds } = await runArtLoop(poem);
+      setSegments((prev) => [...prev, { finalPoem: poem, textRounds, image, artRounds }]);
+      setCurrent(null);
+    } catch (e) {
+      setError(e.message || "Something went wrong. Try again.");
+      setCurrent(null);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: C.parchment,
+        backgroundImage: "radial-gradient(ellipse at top, rgba(0,0,0,0.03), transparent 60%)",
+        fontFamily: "'Crimson Text', serif",
+        color: C.ink,
+        padding: "40px 20px 80px",
+      }}
+    >
+      <div style={{ maxWidth: 640, margin: "0 auto" }}>
+        <header style={{ textAlign: "center", marginBottom: 36 }}>
+          <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: "0.2em", color: C.gold, textTransform: "uppercase", marginBottom: 8 }}>
+            Poet & Critic (Claude) · Illustrator (local WebGPU, free) & Critic (Claude)
+          </div>
+          <h1 style={{ fontFamily: "'Playfair Display', serif", fontWeight: 900, fontSize: 40, margin: 0, color: C.ink }}>
+            The Story-Poem Loom
+          </h1>
+          <p style={{ fontFamily: "'Crimson Text', serif", fontStyle: "italic", color: C.inkFaint, fontSize: 15, marginTop: 6 }}>
+            Watch each segment get written and drawn, then argued over, until it earns its place on the page.
+          </p>
+        </header>
+
+        {segments.length === 0 && !current && (
+          <>
+            <div style={{ marginBottom: 16, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.inkFaint, textAlign: "center" }}>
+              First illustration will download a ~300–600MB model to this device. That only happens once per browser.
+            </div>
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <label style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: "0.08em", color: C.inkFaint, textTransform: "uppercase" }}>
+                  Premise
+                </label>
+                <button
+                  onClick={() => setPremise(randomPremise(premise))}
+                  style={{
+                    background: "none",
+                    border: `1px solid ${C.gold}`,
+                    color: C.gold,
+                    borderRadius: 4,
+                    padding: "3px 10px",
+                    fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: 11,
+                    letterSpacing: "0.05em",
+                    cursor: "pointer",
+                  }}
+                >
+                  🎲 Randomize
+                </button>
+              </div>
+              <textarea
+                value={premise}
+                onChange={(e) => setPremise(e.target.value)}
+                rows={3}
+                style={{
+                  width: "100%",
+                  marginTop: 6,
+                  background: "#fff9ef",
+                  border: `1px solid ${C.parchmentDark}`,
+                  borderRadius: 4,
+                  padding: 10,
+                  fontFamily: "'Crimson Text', serif",
+                  fontSize: 15,
+                  color: C.ink,
+                  resize: "vertical",
+                  boxSizing: "border-box",
+                }}
+              />
+            </div>
+          </>
+        )}
+
+        {segments.map((seg, idx) => (
+          <SegmentCard key={idx} index={idx} textRounds={seg.textRounds} artRounds={seg.artRounds} inProgress={false} />
+        ))}
+
+        {current && (
+          <SegmentCard
+            index={segments.length}
+            textRounds={current.textRounds}
+            artRounds={current.artRounds}
+            inProgress={true}
+            stageLabel={current.stageLabel}
+          />
+        )}
+
+        <div ref={scrollRef} />
+
+        {error && <div style={{ color: C.crimson, fontSize: 13, marginBottom: 12 }}>{error}</div>}
+
+        <div style={{ textAlign: "center", marginTop: 20 }}>
+          <button
+            onClick={generateSegment}
+            disabled={busy}
+            style={{
+              background: busy ? C.parchmentDark : C.ink,
+              color: busy ? C.inkFaint : C.parchment,
+              border: "none",
+              borderRadius: 4,
+              padding: "12px 28px",
+              fontFamily: "'Playfair Display', serif",
+              fontWeight: 700,
+              fontSize: 15,
+              letterSpacing: "0.03em",
+              cursor: busy ? "default" : "pointer",
+            }}
+          >
+            {busy ? "Working…" : segments.length === 0 ? "Begin the Poem" : "Write the Next Segment"}
+          </button>
+          {busy && (
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: C.inkFaint, marginTop: 10 }}>
+              stops each round when the average score reaches {SCORE_TARGET}, or after {MAX_ROUNDS} rounds
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div
+          style={{
+            maxWidth: 480,
+            margin: "80px auto",
+            padding: 24,
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 13,
+            color: C.crimson,
+            background: "#fff9ef",
+            border: `1px solid ${C.crimson}`,
+            borderRadius: 6,
+          }}
+        >
+          <div style={{ fontWeight: "bold", marginBottom: 8 }}>The page hit an error and stopped:</div>
+          <div>{String(this.state.error.message || this.state.error)}</div>
+          <div style={{ marginTop: 12, color: C.inkFaint }}>Reload the page to start again — earlier segments aren't saved between reloads.</div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <ErrorBoundary>
+    <StoryPoemLoom />
+  </ErrorBoundary>
+);
+</script>
+</body>
+</html>
